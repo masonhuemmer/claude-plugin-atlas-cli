@@ -11,8 +11,17 @@ Requires Claude Code **2.1.296 or later with native mods enabled**, an authentic
 From the project you want Claude to work on:
 
 ```sh
-claude --plugin-dir /absolute/path/to/atlas-tickets
+claude --plugin-dir /absolute/path/to/claude-plugin-atlas-cli
 ```
+
+To load the local checkout in every project without the flag, link it into your personal skills directory (adjust the checkout path if needed):
+
+```sh
+mkdir -p ~/.claude/skills
+ln -s "$PWD" ~/.claude/skills/atlas-tickets
+```
+
+Start future sessions with `claude`. Run `/reload-plugins` in an existing session to load the plugin or apply code updates. The repository is named `claude-plugin-atlas-cli`; the plugin is registered as `atlas-tickets`.
 
 Then run `/atlas` or `/atlas SDO-123`. The native pane docks beside a wide fullscreen terminal and appears above the prompt in a narrower terminal. Use Tab to move between fields and buttons, Enter to submit a field or press a button, and Escape to close the pane.
 
