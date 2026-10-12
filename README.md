@@ -72,3 +72,7 @@ The native test suite uses fake Atlas responses, a fake clock, a fake store, and
 The implementation uses Anthropic's [native mods API](https://code.claude.com/docs/en/plugins/mods/overview), [terminal UI elements](https://code.claude.com/docs/en/plugins/mods/interface), and [native testing kit](https://code.claude.com/docs/en/plugins/mods/test). Native mods are version dependent; this release is validated against Claude Code 2.1.296.
 
 A live synthetic-ticket check also exercises a real Haiku researcher and the saved-document handoff. It uses a local Atlas fixture and performs no Jira writes. Custom plugin tools were not routed into plugin-spawned subagents in the tested Claude Code build, so research uses the built-in file tools.
+
+## License
+
+[MIT](LICENSE), matching Herdr's Atlas integration.
