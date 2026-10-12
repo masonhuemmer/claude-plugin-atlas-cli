@@ -16,13 +16,18 @@ claude --plugin-dir /absolute/path/to/atlas-tickets
 
 Then run `/atlas` or `/atlas SDO-123`. The native pane docks beside a wide fullscreen terminal and appears above the prompt in a narrower terminal. Use Tab to move between fields and buttons, Enter to submit a field or press a button, and Escape to close the pane.
 
-1. Set **Outcome** to the deliverable you want, such as “Implement ticket attachments” or “Write the incident report.” An empty outcome takes the first attached ticket's summary.
-2. Find a ticket by key or summary, then select **+** to attach it. A blank search lists your recently updated active tickets. Set **Site** to an Atlas alias if a multi-site search needs one.
-3. Select an attached ticket to inspect its description, status, research, and board. **Choose board** shows the board column separately from the Jira status.
-4. **Change status** fetches available Jira transitions. Select one, inspect the destination, then press **Apply Jira transition**. This is the only Jira write the plugin performs.
-5. Haiku starts researching on attachment. **View brief** opens the saved document. A ready brief is shared automatically with the next submitted prompt to the main agent; **Share** also marks it for that handoff.
+1. Open **Add ticket** to find a ticket by key, summary, or abbreviation. Results filter as you type; press Enter to search Jira for more candidates. Choose **Attach** to attach a result, or **Open** for a ticket already attached. A blank search lists your active tickets.
+2. Attaching opens the ticket view. **Change status** sits directly below the current **Jira status** and is focused by default. Press Enter or `s` to open it, choose a destination with the arrow keys and Enter, inspect the preview, then select **Apply → destination**. Status changes do not require a board. This is the only Jira write the plugin performs.
+3. Use **Tickets** to return to your attached ticket. With multiple attachments, the **Attached ticket** selector switches between them. `/atlas` also opens this view when tickets are attached; `/atlas search words` opens search.
+4. Haiku starts researching on attachment. **View brief** opens the saved document. A ready brief is shared automatically with the next submitted prompt to the main agent. **Research again** refreshes its sources and regenerates it.
+5. **Details & board** reveals the full summary, description, Jira link, fetch time, and optional board selector. **Choose board** shows the board column separately from the Jira status.
+6. **Settings** contains **Outcome** and the optional **Jira site** alias for multi-site searches. Set the outcome to the deliverable you want, such as “Implement ticket attachments” or “Write the incident report.” An empty outcome takes the first attached ticket's summary.
 
 The compact strip above the prompt shows the outcome, attached tickets, status, and research state. Each submitted prompt captures its attached tickets, and the completed response links that same set. Changes made during a turn apply to newly submitted prompts; already queued prompts retain their earlier attachments. Completing agent work does not change Jira status.
+
+Search matches partial keys (`AT42`, `AT-4`), reordered words, abbreviations (`tkt pkr`), and single-letter typos including transpositions (`tikcet picker`). Exact matches rank above approximate ones. Typing searches a session cache seeded with up to 100 of your active tickets and 100 recently updated tickets on the selected site. Enter combines Jira suggestions with broader summary-prefix candidates and applies the same fuzzy ranking; this can find older tickets outside the initial cache. Up to 400 discovered tickets stay cached while the plugin is loaded. The picker initially shows eight results, with **Show more** for the rest.
+
+Fuzzy search is bounded by those candidates, rather than a complete local index of Jira. An exact ticket key performs a direct lookup. Jira Cloud [ignores fuzzy text-search operators](https://support.atlassian.com/jira-software-cloud/docs/search-for-work-items-using-the-text-field/), so typo and abbreviation matching is implemented in the plugin.
 
 ## Research and persistence
 
@@ -51,7 +56,7 @@ npm run typecheck
 
 Load the plugin once in an interactive Claude Code session before typechecking. Claude writes the API definitions for your installed version into `.claude-plugin/types/`, which is ignored by Git. There are no runtime package dependencies or build step.
 
-The native test suite uses fake Atlas responses, a fake store, and a fake researcher. It exercises UI presses, transition previews and failures, durable brief delivery, session isolation, research tool permissions, stale sources, and late completion handling without Jira writes or model calls.
+The native test suite uses fake Atlas responses, a fake store, and a fake researcher. It exercises live fuzzy filtering, search ranking and candidate discovery, ticket navigation, transition previews and failures, durable brief delivery, session isolation, research tool permissions, stale sources, and late completion handling without Jira writes or model calls.
 
 The implementation uses Anthropic's [native mods API](https://code.claude.com/docs/en/plugins/mods/overview), [terminal UI elements](https://code.claude.com/docs/en/plugins/mods/interface), and [native testing kit](https://code.claude.com/docs/en/plugins/mods/test). Native mods are version dependent; this release is validated against Claude Code 2.1.296.
 

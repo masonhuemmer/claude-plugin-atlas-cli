@@ -21,6 +21,8 @@ function fixture(on: On) {
     session: 'session-a', issue: { ...ISSUE }, saved: new Map<string, unknown>(), files: new Map<string, string>(),
     agent: {} as Record<string, unknown>, commands: [] as string[][], spawns: [] as Record<string, unknown>[], failGet: false,
     failWrite: false, failTransition: false, transitionStatus: 'In Progress', gitDiff: '',
+    searchItems: undefined as Issue[] | undefined, suggestions: undefined as Issue[] | undefined,
+    discovered: undefined as Issue[] | undefined,
   };
   on('session.id', () => ({ value: f.session }));
   on('session.cwd', () => ({ value: '/repo' }));
@@ -50,7 +52,8 @@ function fixture(on: On) {
     if (argv[0] === 'git') return { value: { isStdoutTruncated: false, isStderrTruncated: false, exitCode: 0, stdout: argv[1] === 'diff' ? f.gitDiff : 'abc123', stderr: '' } };
     if (argv[0] === 'rg') return { value: { isStdoutTruncated: false, isStderrTruncated: false, exitCode: 0, stdout: 'src/picker.ts\nREADME.md\n', stderr: '' } };
     if (argv[2] === 'get') return f.failGet ? { value: { isStdoutTruncated: false, isStderrTruncated: false, exitCode: 5, stdout: '', stderr: 'Jira unavailable' } } : ok({ ...f.issue, key: argv[3], browse_url: `https://${f.issue.site}/browse/${argv[3]}` });
-    if (argv[2] === 'suggest' || argv[2] === 'search') return ok({ items: [f.issue] });
+    if (argv[2] === 'suggest') return ok({ items: f.suggestions ?? [f.issue] });
+    if (argv[2] === 'search') return ok({ items: argv[4]?.startsWith('(summary') ? f.discovered ?? f.searchItems ?? [f.issue] : f.searchItems ?? [f.issue] });
     if (argv[2] === 'boards') return ok([{ id: 7, name: 'Product' }]);
     if (argv[2] === 'board') return ok({ schema_version: 1, board_id: 7, board_name: 'Product', state: 'in_column', column: f.issue.status === 'Open' ? 'Backlog' : 'Doing', status: f.issue.status, on_board: true });
     if (argv[2] === 'transitions') return ok({ items: [{ id: '21', name: 'Start work', to_status: f.transitionStatus, column: 'Doing' }] });
@@ -69,12 +72,59 @@ const completion = (agentId: string | undefined, answer = '## Findings\nThe pick
   answer, durationMs: 10, isAborted: false, reason: 'answer', turnId: agentId ? 'research-turn' : 'main-turn', ...(agentId ? { agentId } : {}),
 } as const);
 
+test('fuzzy search filters while typing and keeps typo matches when Jira suggestions miss', async ($, on) => {
+  const f = fixture(on);
+  const other = { ...ISSUE, key: 'AT-99', browse_url: 'https://example.atlassian.net/browse/AT-99', summary: 'Rotate database credentials' };
+  f.searchItems = [other, ISSUE]; f.suggestions = [];
+  await $.session.start(START);
+  await $.command.run({ command: 'atlas', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 100 }, args: '' });
+  const ui = await $.ui.mount(PANE);
+  const reads = f.commands.length;
+  await ui.input({ key: 'search', text: 'tikcet pcker', kind: 'change' });
+  expect(await ui.find({ key: `attach-${ticketID(other)}` })).toBeUndefined();
+  expect(await ui.find({ key: `attach-${ID}` })).toBeDefined();
+  expect(f.commands).toHaveLength(reads);
+  await ui.input({ key: 'search', text: 'tikcet pcker' });
+  expect(await ui.find({ key: `attach-${ID}` })).toBeDefined();
+});
+
+test('attaching opens a focused ticket view with status controls instead of search results', async ($, on) => {
+  fixture(on);
+  await $.session.start(START);
+  await $.command.run({ command: 'atlas', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 100 }, args: '' });
+  const ui = await $.ui.mount(PANE);
+  await ui.press({ key: `attach-${ID}` });
+  expect(await ui.find({ key: 'search' })).toBeUndefined();
+  expect(await ui.find({ key: `attach-${ID}` })).toBeUndefined();
+  expect(await ui.find({ key: 'status', text: /Change status/ })).toBeDefined();
+  await $.command.run({ command: 'atlas', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 100 }, args: '' });
+  expect(await ui.find({ key: 'search' })).toBeUndefined();
+  expect((await ui.find({ key: 'status' }))?.props.hotkey).toBe('s');
+  await ui.press({ key: 'status' });
+  expect(await ui.find({ key: 'transition' })).toBeDefined();
+});
+
+test('Enter discovers and fuzzy ranks tickets outside the recent cache', async ($, on) => {
+  const f = fixture(on);
+  f.searchItems = []; f.suggestions = []; f.discovered = [ISSUE];
+  await $.session.start(START);
+  await $.command.run({ command: 'atlas', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 100 }, args: '' });
+  const ui = await $.ui.mount(PANE);
+  await ui.input({ key: 'search', text: 'tikcet pcker', kind: 'change' });
+  expect(await ui.find({ key: `attach-${ID}` })).toBeUndefined();
+  await ui.input({ key: 'search', text: 'tikcet pcker' });
+  expect(await ui.find({ key: `attach-${ID}` })).toBeDefined();
+  expect(f.commands.some(a => a[2] === 'search' && a[4].includes('summary ~ "ti*"'))).toBe(true);
+});
+
 test('picker attaches an outcome and Haiku creates a durable brief for the main agent', async ($, on) => {
   const f = fixture(on);
   await $.session.start(START);
   await $.command.run({ command: 'atlas', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 100 }, args: 'AT-42' });
   const ui = await $.ui.mount(PANE);
+  await ui.press({ key: 'settings' });
   await ui.input({ key: 'outcome', text: 'Implement ticket attachments' });
+  await ui.press({ key: 'add-ticket' });
   await ui.press({ key: `attach-${ID}` });
   expect(f.spawns[0].model).toBe('haiku');
   expect(f.spawns[0].subagent_type).toBe('atlas-tickets:researcher');
@@ -100,6 +150,7 @@ test('status picker previews a real transition and applies its id only after App
   await $.command.run({ command: 'atlas', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 100 }, args: '' });
   const ui = await $.ui.mount(PANE);
   await ui.press({ key: `attach-${ID}` });
+  await ui.press({ key: 'details' });
   await ui.press({ key: 'boards' });
   await ui.select({ key: 'board', value: '7' });
   await ui.press({ key: 'status' });
@@ -155,14 +206,14 @@ test('resume restores bindings while clear and fork start unbound', async ($, on
   await ui.press({ key: `attach-${ID}` });
   f.session = 'session-b';
   await $.classic.SessionStart({ source: 'clear' });
-  expect(await ui.find({ key: `ticket-${ID}` })).toBeUndefined();
+  expect(await ui.find({ key: 'status' })).toBeUndefined();
   f.session = 'session-a';
   await $.classic.SessionStart({ source: 'resume' });
-  expect(await ui.find({ key: `ticket-${ID}` })).toBeDefined();
+  expect(await ui.find({ type: 'Text', text: `${ISSUE.key}: ${ISSUE.summary}` })).toBeDefined();
   expect(await ui.find({ type: 'Text', text: 'Research: failed' })).toBeDefined();
   f.session = 'session-c';
   await $.classic.SessionStart({ source: 'fork' });
-  expect(await ui.find({ key: `ticket-${ID}` })).toBeUndefined();
+  expect(await ui.find({ key: 'status' })).toBeUndefined();
 });
 
 test('changing the outcome discards a pending brief', async ($, on) => {
@@ -171,7 +222,9 @@ test('changing the outcome discards a pending brief', async ($, on) => {
   await $.command.run({ command: 'atlas', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 100 }, args: 'AT-42' });
   const ui = await $.ui.mount(PANE);
   await ui.press({ key: `attach-${ID}` });
+  await ui.press({ key: 'settings' });
   await ui.input({ key: 'outcome', text: 'Write a design report' });
+  await ui.press({ key: 'tickets' });
   await $.turn.complete(completion('research-1'));
   expect(f.files.size).toBe(0);
   expect(await ui.find({ type: 'Text', text: 'Research: stale' })).toBeDefined();
@@ -228,9 +281,11 @@ test('multiple tickets attach to one outcome and duplicate attachment starts no 
   await $.command.run({ command: 'atlas', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 100 }, args: 'AT-42' });
   const ui = await $.ui.mount(PANE);
   await ui.press({ key: `attach-${ID}` });
+  await ui.press({ key: 'add-ticket' });
   await ui.press({ key: `attach-${ID}` });
   expect(f.spawns).toHaveLength(1);
   f.issue = { ...ISSUE, key: 'AT-43', browse_url: 'https://example.atlassian.net/browse/AT-43', summary: 'Add research' };
+  await ui.press({ key: 'add-ticket' });
   await ui.input({ key: 'search', text: 'AT-43' });
   await ui.press({ key: `attach-${ticketID(f.issue)}` });
   await $.turn.start({ text: 'Implement both', turnId: 'main-turn' });

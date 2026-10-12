@@ -4,6 +4,7 @@ import {
   message, readIssue, researcherPrompt, researchPrompt, safeSegment, sourceFingerprint, ticketID, ticketKey,
 } from './model.ts';
 import type { Binding, Board, Issue, Job, Placement, Ticket, Transition } from './model.ts';
+import { candidateJQL, mergeIssues, rankIssues } from './search.ts';
 
 const PANE = 'atlas-tickets';
 let binding = empty();
@@ -14,6 +15,15 @@ let busy = false;
 let notice = '';
 let selected = '';
 let results: Issue[] = [];
+let candidates: Issue[] = [];
+let recent: Issue[] = [];
+let remote: Issue[] = [];
+let remoteQuery = '';
+let searchText = '';
+let resultLimit = 8;
+let screen: 'search' | 'ticket' | 'settings' = 'search';
+let statusOpen = false;
+let detailsOpen = false;
 let boards: Board[] = [];
 let transitions: Transition[] = [];
 let transitionID = '';
@@ -50,6 +60,8 @@ async function hydrate($: EngineInterface): Promise<void> {
   }
   selected = binding.tickets[0] ? ticketID(binding.tickets[0].issue) : '';
   results = []; boards = []; transitions = []; transitionID = ''; viewingBrief = '';
+  candidates = []; recent = []; remote = []; remoteQuery = ''; searchText = ''; resultLimit = 8;
+  screen = selected ? 'ticket' : 'search'; statusOpen = false; detailsOpen = false;
   turnBinding = undefined; activeTurn = ''; submitted = []; busy = false; notice = '';
   await save($);
 }
@@ -70,20 +82,58 @@ async function atlas($: EngineInterface, args: string[], site = binding.site): P
   catch { throw new Error('Atlas returned invalid JSON. Install an Atlas build with board and suggestion support.'); }
 }
 
-async function search($: EngineInterface, query: string): Promise<void> {
-  const started = epoch;
-  const q = query.trim();
-  const value = ticketKey(q.toUpperCase())
-    ? { items: [await atlas($, ['get', q.toUpperCase()])] }
-    : await atlas($, q ? ['suggest', '--query', q] :
-      ['search', '--jql', 'assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC', '--limit', '15']);
+function searchItems(value: unknown): Issue[] {
   const items = (value as { items: unknown[] }).items;
   if (!Array.isArray(items)) throw new Error('Atlas returned an invalid search response.');
-  if (started === epoch) { results = items.slice(0, 15).map(readIssue); notice = results.length ? '' : 'No tickets found.'; }
+  return items.map(readIssue);
+}
+
+function filterSearch(): void {
+  const attached = binding.tickets.map(t => t.issue);
+  results = searchText.trim() ? rankIssues(searchText, mergeIssues(candidates, attached), remoteQuery === searchText.trim() ? remote : []) : recent;
+  resultLimit = 8;
+}
+
+async function search($: EngineInterface, query: string): Promise<void> {
+  const started = epoch;
+  const site = binding.site;
+  searchText = query.slice(0, 120);
+  const q = searchText.trim();
+  filterSearch(); $.ui.invalidate('ui.render');
+  if (!q || !candidates.length) {
+    const lists = await Promise.allSettled([
+      atlas($, ['search', '--jql', 'assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC', '--limit', '100'], site).then(searchItems),
+      atlas($, ['search', '--jql', 'ORDER BY updated DESC', '--limit', '100'], site).then(searchItems),
+    ]);
+    if (started !== epoch) return;
+    recent = lists[0].status === 'fulfilled' ? lists[0].value : [];
+    candidates = mergeIssues(candidates, recent, lists[1].status === 'fulfilled' ? lists[1].value : []).slice(-400);
+    filterSearch(); $.ui.invalidate('ui.render');
+    if (lists.every(list => list.status === 'rejected') && !q) throw new Error(message((lists[0] as PromiseRejectedResult).reason));
+  }
+  if (q) {
+    const jql = candidateJQL(q);
+    const lists = await Promise.allSettled(ticketKey(q.toUpperCase())
+      ? [atlas($, ['get', q.toUpperCase()], site).then(value => [readIssue(value)])]
+      : [atlas($, ['suggest', '--query', q], site).then(searchItems),
+        ...(jql ? [atlas($, ['search', '--jql', jql, '--limit', '100'], site).then(searchItems)] : [])]);
+    if (started !== epoch) return;
+    remote = lists[0].status === 'fulfilled' ? lists[0].value : []; remoteQuery = q;
+    candidates = mergeIssues(candidates, ...lists.filter(list => list.status === 'fulfilled').map(list => list.value)).slice(-400);
+    filterSearch();
+    const failed = lists.find(list => list.status === 'rejected');
+    if (failed?.status === 'rejected' && searchText.trim() === q) notice = `Jira search incomplete: ${message(failed.reason)} Cached matches are still shown.`;
+  }
+  if (searchText.trim() === q && !results.length && !notice) notice = q ? 'No matches. Try fewer words or an exact ticket key.' : 'No active tickets assigned to you. Type to search recent tickets or press Enter to search Jira.';
+}
+
+function showTicket(id: string): void {
+  selected = id; screen = 'ticket'; statusOpen = false; detailsOpen = false;
+  transitions = []; transitionID = ''; boards = []; viewingBrief = ''; notice = '';
 }
 
 async function attach($: EngineInterface, issue: Issue): Promise<void> {
-  if (binding.tickets.some(t => ticketID(t.issue) === ticketID(issue))) { selected = ticketID(issue); return; }
+  if (binding.tickets.some(t => ticketID(t.issue) === ticketID(issue))) { showTicket(ticketID(issue)); return; }
   const started = epoch;
   const full = readIssue(await atlas($, ['get', issue.key], issue.site));
   const now = await $.clock.now();
@@ -91,7 +141,7 @@ async function attach($: EngineInterface, issue: Issue): Promise<void> {
   const ticket: Ticket = { issue: full, fetchedAt: now };
   if (!binding.outcome) binding.outcome = full.summary;
   binding.tickets.push(ticket);
-  selected = ticketID(full); transitions = []; transitionID = ''; boards = [];
+  showTicket(ticketID(full));
   await save($);
   await research($, ticket);
 }
@@ -135,7 +185,7 @@ async function loadTransitions($: EngineInterface, ticket: Ticket): Promise<void
   if (!Array.isArray(value.items) || value.items.some(t => typeof t.id !== 'string' || !t.id || typeof t.to_status !== 'string')) throw new Error('Atlas returned invalid transitions.');
   if (started === epoch && current() === ticket) {
     transitions = value.items; transitionID = '';
-    notice = transitions.length ? 'Choose a transition to preview it.' : 'No available transitions.';
+    notice = transitions.length ? '' : 'No available transitions.';
   }
 }
 
@@ -154,6 +204,7 @@ async function applyTransition($: EngineInterface, ticket: Ticket, chosen: Trans
   }
   if (started !== epoch) return;
   transitions = [];
+  statusOpen = false;
   await refresh($, ticket);
   notice = `Jira now reports ${ticket.issue.status}.`;
 }
@@ -259,8 +310,10 @@ export function register(on: On): void {
   on('agent.offer', { agent: 'atlas-tickets:researcher' }, () => ({ isOffered: false }));
 
   on('command.run', { command: 'atlas' }, async ($, e) => {
+    screen = e.args.trim() || !binding.tickets.length ? 'search' : 'ticket';
+    statusOpen = false; detailsOpen = false; viewingBrief = ''; notice = '';
     await $.ui.open({ id: PANE, title: 'Atlas Tickets', focus: true, closeOnEscape: true, rows: 20, columns: 52 });
-    await act($, () => search($, e.args));
+    if (screen === 'search') await act($, () => search($, e.args));
     return {};
   });
 
@@ -307,9 +360,11 @@ export function register(on: On): void {
     if (!binding.tickets.length) return original;
     const { Box, Text, Button } = $.ui.resolve(e);
     return Box({ flexDirection: 'column', children: [original, Box({ flexDirection: 'row', gap: 1, children: [
-      Button({ key: 'atlas-open', label: 'Atlas', onPress: () => $.ui.open({ id: PANE, title: 'Atlas Tickets', focus: true, closeOnEscape: true, rows: 20, columns: 52 }) }),
-      Text({ color: 'cyan', children: binding.outcome }),
-      Text({ dimColor: true, children: binding.tickets.map(t => `${t.issue.key} · ${t.issue.status}${t.error ? ' (cached)' : ''} · ${t.brief?.status ?? 'no brief'}`).join(' | ') }),
+      Button({ key: 'atlas-open', label: 'Atlas', onPress: () => {
+        showTicket(selected || ticketID(binding.tickets[0].issue));
+        return $.ui.open({ id: PANE, title: 'Atlas Tickets', focus: true, closeOnEscape: true, rows: 20, columns: 52 });
+      } }),
+      Text({ dimColor: true, wrap: 'truncate-end', children: `${binding.tickets.map(t => `${t.issue.key} · ${t.issue.status}${t.error ? ' (cached)' : ''} · ${t.brief?.status ?? 'no brief'}`).join(' | ')} · ${binding.outcome}` }),
     ] })] });
   });
 
@@ -318,76 +373,133 @@ export function register(on: On): void {
     const { Box, Text, Button, Input, Select, Markdown } = $.ui.resolve(e);
     const rows: RenderElement[] = [];
     const ticket = current();
-    rows.push(Text({ bold: true, color: 'cyan', children: 'ATLAS TICKETS' }));
-    if (activeTurn) rows.push(Text({ dimColor: true, children: 'Attachment changes apply to newly submitted prompts.' }));
+    rows.push(Box({ flexDirection: 'row', gap: 1, children: [
+      Button({ key: 'tickets', label: `Tickets (${binding.tickets.length})`, onPress: () => {
+        if (busy) return;
+        showTicket(selected || (binding.tickets[0] ? ticketID(binding.tickets[0].issue) : '')); $.ui.invalidate('ui.render');
+      } }),
+      Button({ key: 'add-ticket', label: 'Add ticket', onPress: () => act($, async () => {
+        screen = 'search'; viewingBrief = ''; statusOpen = false;
+        if (!candidates.length) await search($, ''); else filterSearch();
+      }) }),
+      Button({ key: 'settings', label: 'Settings', onPress: () => {
+        if (busy) return;
+        screen = 'settings'; notice = ''; $.ui.invalidate('ui.render');
+      } }),
+    ] }));
+    rows.push(Text({ dimColor: true, wrap: 'truncate-end', children: `Outcome: ${binding.outcome || 'Uses the first attached ticket’s summary'}` }));
     if (busy) rows.push(Text({ color: 'yellow', children: 'Working…' }));
     if (notice) rows.push(Text({ color: 'yellow', children: notice }));
-    rows.push(Input({ key: 'outcome', label: 'Outcome', value: binding.outcome, placeholder: 'What should this session produce?', onSubmit: value => act($, async () => {
-      const title = value.trim().slice(0, 300);
-      if (!title) throw new Error('Enter an outcome.');
-      if (binding.outcome !== title) {
-        binding.outcome = title;
-        for (const t of binding.tickets) if (t.brief) t.brief.status = 'stale';
-        await save($);
-      }
-    }) }));
-    rows.push(Input({ key: 'site', label: 'Site (optional)', value: binding.site, placeholder: 'Atlas site alias, for multi-site searches', onSubmit: value => act($, async () => {
-      binding.site = value.trim().slice(0, 200); results = []; await save($);
-    }) }));
-    rows.push(Input({ key: 'search', label: 'Find ticket', placeholder: 'KEY-123 or summary; Enter searches', autoFocus: true, onSubmit: value => act($, () => search($, value)) }));
-    if (binding.tickets.length) {
-      rows.push(Text({ bold: true, children: 'Attached to this outcome' }));
-      for (const t of binding.tickets) rows.push(Button({ key: `ticket-${ticketID(t.issue)}`, label: `${selected === ticketID(t.issue) ? '› ' : ''}${t.issue.key} · ${t.issue.status} · ${t.brief?.status ?? 'no brief'}`, onPress: () => {
-        if (busy) return;
-        selected = ticketID(t.issue); transitions = []; transitionID = ''; boards = []; viewingBrief = ''; $.ui.invalidate('ui.render');
-      } }));
-    }
-    for (const issue of results) {
-      const attached = binding.tickets.some(t => ticketID(t.issue) === ticketID(issue));
-      rows.push(Button({ key: `attach-${ticketID(issue)}`, label: `${attached ? '✓' : '+'} ${issue.key} · ${issue.summary}`, onPress: () => act($, () => attach($, issue)) }));
-    }
-    if (ticket) {
-      rows.push(Text({ bold: true, children: `${ticket.issue.key}: ${ticket.issue.summary}` }));
-      rows.push(Text({ children: ticket.issue.browse_url }));
-      rows.push(Text({ children: `Jira status: ${ticket.issue.status}${ticket.error ? ' (cached, unavailable)' : ''}` }));
-      rows.push(Text({ dimColor: true, children: `Last fetched: ${new Date(ticket.fetchedAt).toISOString()}` }));
-      if (ticket.error) rows.push(Text({ color: 'yellow', children: ticket.error }));
-      rows.push(Text({ children: ticket.board ? `Board: ${ticket.board.name} · Column: ${ticket.placement?.column || ticket.placement?.state || 'unknown'}${ticket.placementError ? ' (cached, unavailable)' : ''}` : 'Board: not selected' }));
-      if (ticket.placementError) rows.push(Text({ color: 'yellow', children: ticket.placementError }));
-      rows.push(Box({ flexDirection: 'row', gap: 1, children: [
-        Button({ key: 'refresh', label: 'Refresh', onPress: () => act($, () => refresh($, ticket)) }),
-        Button({ key: 'boards', label: 'Choose board', onPress: () => act($, () => loadBoards($, ticket)) }),
-        Button({ key: 'status', label: 'Change status', onPress: () => act($, () => loadTransitions($, ticket)) }),
-        Button({ key: 'detach', label: 'Detach', onPress: () => act($, async () => {
-          binding.tickets = binding.tickets.filter(t => t !== ticket); selected = ''; transitions = []; transitionID = ''; boards = []; viewingBrief = ''; await save($);
-        }) }),
-      ] }));
-      if (boards.length) rows.push(Select({ key: 'board', label: 'Board', options: [{ value: '', label: 'Select board…' }, ...boards.map(b => ({ value: String(b.id), label: b.name }))], value: ticket.board ? String(ticket.board.id) : '', onSelect: value => act($, async () => {
-        const board = boards.find(b => String(b.id) === value); if (!board) return;
-        ticket.board = board; delete ticket.placement; transitions = []; transitionID = ''; await refresh($, ticket);
+    if (screen === 'settings') {
+      rows.push(Text({ bold: true, children: 'Session settings' }));
+      rows.push(Input({ key: 'outcome', label: 'Outcome', value: binding.outcome, autoFocus: true, placeholder: 'What should this session produce?', onSubmit: value => act($, async () => {
+        const title = value.trim().slice(0, 300);
+        if (!title) throw new Error('Enter an outcome.');
+        if (binding.outcome !== title) {
+          binding.outcome = title;
+          for (const t of binding.tickets) if (t.brief) t.brief.status = 'stale';
+          await save($);
+        }
+        notice = 'Outcome saved.';
       }) }));
-      if (transitions.length) rows.push(Select({ key: 'transition', label: 'Transition', options: [{ value: '', label: 'Choose…' }, ...transitions.map(t => ({ value: t.id, label: `${t.name} → ${t.to_status}${t.column ? ` / ${t.column}` : ''}` }))], value: transitionID, onSelect: value => {
-        if (!busy) { transitionID = value; $.ui.invalidate('ui.render'); }
+      rows.push(Input({ key: 'site', label: 'Jira site (optional)', value: binding.site, placeholder: 'Atlas site alias for multi-site searches', onSubmit: value => act($, async () => {
+        binding.site = value.trim().slice(0, 200); results = []; candidates = []; recent = []; remote = []; remoteQuery = ''; searchText = '';
+        await save($); notice = 'Site saved. Open Add ticket to search.';
+      }) }));
+      rows.push(Text({ dimColor: true, children: 'Outcome changes mark existing research stale.' }));
+    } else if (screen === 'search') {
+      rows.push(Input({ key: 'search', label: 'Find ticket', value: searchText, placeholder: 'Key, words, or abbreviation', autoFocus: true,
+        onInput: value => { searchText = value.slice(0, 120); notice = ''; filterSearch(); $.ui.invalidate('ui.render'); },
+        onSubmit: value => act($, () => search($, value)), submitLabel: 'Search Jira',
+      }));
+      rows.push(Text({ dimColor: true, children: 'Type to fuzzy filter · Enter searches Jira' }));
+      rows.push(Text({ dimColor: true, children: searchText.trim() ? `${results.length} matches · recent tickets + Jira results` : 'Your active tickets · type to search recent tickets' }));
+      for (const issue of results.slice(0, resultLimit)) {
+        const attached = binding.tickets.some(t => ticketID(t.issue) === ticketID(issue));
+        const width = Math.max(12, e.props.bodyColumns - issue.key.length - 12);
+        const summary = issue.summary.length > width ? `${issue.summary.slice(0, width - 1)}…` : issue.summary;
+        rows.push(Button({ key: `attach-${ticketID(issue)}`, label: `${attached ? 'Open' : 'Attach'} ${issue.key} · ${summary}`, onPress: () => act($, () => attach($, issue)) }));
+      }
+      if (!results.length && !busy) rows.push(Text({ children: 'No matches. Press Enter to search Jira, or try a ticket key.' }));
+      if (results.length > resultLimit) rows.push(Button({ key: 'more-results', label: `Show more (${resultLimit} of ${results.length})`, onPress: () => {
+        resultLimit += 8; $.ui.invalidate('ui.render');
       } }));
-      const chosen = transitions.find(t => t.id === transitionID);
-      if (chosen) {
-        rows.push(Text({ color: 'yellow', children: `Apply to ${ticket.issue.key}: ${ticket.issue.status} → ${chosen.to_status}${chosen.column ? ` (column: ${chosen.column})` : ''}` }));
-        rows.push(Button({ key: 'apply-status', label: 'Apply Jira transition', onPress: () => act($, () => applyTransition($, ticket, chosen)) }));
+    } else if (ticket) {
+      if (binding.tickets.length > 1) rows.push(Select({ key: 'attached', label: 'Attached ticket', value: selected,
+        options: binding.tickets.map(t => ({ value: ticketID(t.issue), label: `${t.issue.key} · ${t.issue.summary}` })),
+        onSelect: value => { if (!busy) { showTicket(value); $.ui.invalidate('ui.render'); } },
+      }));
+      rows.push(Text({ bold: true, color: 'cyan', wrap: 'truncate-end', children: `${ticket.issue.key}: ${ticket.issue.summary}` }));
+      rows.push(Text({ bold: true, children: `Jira status: ${ticket.issue.status}${ticket.error ? ' (cached, unavailable)' : ''}` }));
+      if (ticket.error) rows.push(Text({ color: 'yellow', children: ticket.error }));
+      if (statusOpen) {
+        rows.push(Text({ bold: true, children: 'Change Jira status' }));
+        if (transitions.length) rows.push(Select({ key: 'transition', label: 'Move to', options: [{ value: '', label: 'Choose status…' }, ...transitions.map(t => ({ value: t.id, label: `${t.to_status} · ${t.name}${t.column ? ` / ${t.column}` : ''}` }))], value: transitionID, onSelect: value => {
+          if (!busy) { transitionID = value; $.ui.invalidate('ui.render'); }
+        } }));
+        const chosen = transitions.find(t => t.id === transitionID);
+        if (chosen) {
+          rows.push(Text({ color: 'yellow', children: `Apply to ${ticket.issue.key}: ${ticket.issue.status} → ${chosen.to_status}${chosen.column ? ` (column: ${chosen.column})` : ''}` }));
+          rows.push(Button({ key: 'apply-status', label: `Apply → ${chosen.to_status}`, onPress: () => act($, () => applyTransition($, ticket, chosen)) }));
+        } else rows.push(Text({ dimColor: true, children: 'Choose a destination, then Apply to update Jira.' }));
+        rows.push(Button({ key: 'cancel-status', label: 'Back to ticket', onPress: () => {
+          if (busy) return;
+          statusOpen = false; transitions = []; transitionID = ''; notice = ''; $.ui.invalidate('ui.render');
+        } }));
+      } else if (viewingBrief) {
+        rows.push(Button({ key: 'back-brief', label: 'Back to ticket', onPress: () => { viewingBrief = ''; $.ui.invalidate('ui.render'); } }));
+        rows.push(Markdown({ text: viewingBrief }));
+      } else {
+        rows.push(Box({ flexDirection: 'row', gap: 1, children: [
+          Button({ key: 'status', label: 'Change status', hotkey: 's', autoFocus: true, onPress: () => act($, async () => {
+            statusOpen = true; await loadTransitions($, ticket);
+          }) }),
+          Button({ key: 'refresh', label: 'Refresh', hotkey: 'r', onPress: () => act($, () => refresh($, ticket)) }),
+        ] }));
+        rows.push(Text({ bold: true, children: `Research: ${ticket.brief?.status ?? 'not started'}` }));
+        if (ticket.brief?.error) rows.push(Text({ color: 'yellow', children: ticket.brief.error }));
+        const researchActions: RenderElement[] = [];
+        if (ticket.brief?.path) {
+          researchActions.push(Button({ key: 'view-brief', label: 'View brief', onPress: () => act($, async () => { viewingBrief = await $.fs.read(ticket.brief!.path!); }) }));
+        }
+        if (ticket.brief?.status !== 'researching') researchActions.push(Button({ key: 'research', label: 'Research again', onPress: () => act($, async () => { await refresh($, ticket); await research($, ticket); }) }));
+        if (researchActions.length) rows.push(Box({ flexDirection: 'row', gap: 1, children: researchActions }));
+        if (ticket.brief?.status === 'ready') {
+          if (ticket.brief.share) rows.push(Text({ dimColor: true, children: 'Brief shared with main agent on next prompt.' }));
+          else rows.push(Button({ key: 'share-brief', label: 'Share with main agent on next prompt', onPress: () => act($, async () => {
+            ticket.brief!.share = true; await save($); notice = 'Brief will accompany the next prompt to the main agent.';
+          }) }));
+        }
+        rows.push(Box({ flexDirection: 'row', gap: 1, children: [
+          Button({ key: 'details', label: detailsOpen ? 'Hide details' : 'Details & board', onPress: () => {
+            detailsOpen = !detailsOpen; $.ui.invalidate('ui.render');
+          } }),
+          Button({ key: 'detach', label: `Detach ${ticket.issue.key}`, onPress: () => act($, async () => {
+            binding.tickets = binding.tickets.filter(t => t !== ticket);
+            showTicket(binding.tickets[0] ? ticketID(binding.tickets[0].issue) : ''); await save($);
+          }) }),
+        ] }));
+        if (detailsOpen) {
+          rows.push(Text({ children: ticket.issue.summary }));
+          rows.push(Text({ children: ticket.issue.browse_url }));
+          rows.push(Text({ dimColor: true, children: `Last fetched: ${new Date(ticket.fetchedAt).toISOString()}` }));
+          rows.push(Text({ children: ticket.board ? `Board: ${ticket.board.name} · Column: ${ticket.placement?.column || ticket.placement?.state || 'unknown'}${ticket.placementError ? ' (cached, unavailable)' : ''}` : 'Board: optional; status changes work without one.' }));
+          if (ticket.placementError) rows.push(Text({ color: 'yellow', children: ticket.placementError }));
+          rows.push(Button({ key: 'boards', label: 'Choose board', onPress: () => act($, () => loadBoards($, ticket)) }));
+          if (boards.length) rows.push(Select({ key: 'board', label: 'Board', options: [{ value: '', label: 'Select board…' }, ...boards.map(b => ({ value: String(b.id), label: b.name }))], value: ticket.board ? String(ticket.board.id) : '', onSelect: value => act($, async () => {
+            const board = boards.find(b => String(b.id) === value); if (!board) return;
+            ticket.board = board; delete ticket.placement; transitions = []; transitionID = ''; await refresh($, ticket);
+          }) }));
+          if (ticket.issue.description) rows.push(Text({ children: ticket.issue.description.slice(0, 1800) }));
+          if (ticket.brief?.path) rows.push(Text({ dimColor: true, children: ticket.brief.path }));
+        }
       }
-      if (ticket.issue.description) rows.push(Text({ children: ticket.issue.description.slice(0, 1800) }));
-      rows.push(Text({ bold: true, children: `Research: ${ticket.brief?.status ?? 'not started'}` }));
-      if (ticket.brief?.error) rows.push(Text({ color: 'yellow', children: ticket.brief.error }));
-      if (ticket.brief?.status !== 'researching') rows.push(Button({ key: 'research', label: 'Research again with Haiku', onPress: () => act($, async () => { await refresh($, ticket); await research($, ticket); }) }));
-      if (ticket.brief?.path) {
-        rows.push(Text({ dimColor: true, children: ticket.brief.path }));
-        rows.push(Button({ key: 'view-brief', label: 'View brief', onPress: () => act($, async () => { viewingBrief = await $.fs.read(ticket.brief!.path!); }) }));
-        if (ticket.brief.status === 'ready') rows.push(Button({ key: 'share-brief', label: 'Share with main agent on next turn', onPress: () => act($, async () => {
-          ticket.brief!.share = true; await save($); notice = 'Brief will accompany the next prompt to the main agent.';
-        }) }));
-      }
-      if (viewingBrief) rows.push(Markdown({ text: viewingBrief }));
-    }
-    rows.push(Button({ key: 'close', label: 'Close', onPress: () => $.ui.close({ id: PANE }) }));
-    return Box({ flexDirection: 'column', gap: 1, paddingX: 1, children: rows });
+    } else rows.push(Text({ children: 'No tickets attached. Choose Add ticket to get started.' }));
+    if (activeTurn) rows.push(Text({ dimColor: true, children: 'Attachment changes apply to new prompts.' }));
+    rows.push(Box({ flexDirection: 'row', gap: 1, children: [
+      Button({ key: 'close', label: 'Close', onPress: () => $.ui.close({ id: PANE }) }),
+      Text({ dimColor: true, children: screen === 'ticket' && !statusOpen && !viewingBrief ? 's status · r refresh · Esc close' : 'Tab move · Enter · Esc close' }),
+    ] }));
+    return Box({ flexDirection: 'column', paddingX: 1, children: rows });
   });
 }
