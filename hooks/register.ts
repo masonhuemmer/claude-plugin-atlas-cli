@@ -1,4 +1,4 @@
-import type { EngineInterface, On, RenderElement } from 'claude-code';
+import type { EngineInterface, On, RenderElement, Timer } from 'claude-code';
 import {
   briefDocument, context, empty, fingerprint, footer, loadBinding,
   message, readIssue, researcherPrompt, researchPrompt, safeSegment, sourceFingerprint, ticketID, ticketKey,
@@ -20,6 +20,10 @@ let recent: Issue[] = [];
 let remote: Issue[] = [];
 let remoteQuery = '';
 let searchText = '';
+let searchTimer: Timer | undefined;
+let searchVersion = 0;
+let searching = false;
+let warmed = false;
 let resultLimit = 8;
 let screen: 'search' | 'ticket' | 'settings' = 'search';
 let statusOpen = false;
@@ -45,6 +49,7 @@ async function save($: EngineInterface): Promise<void> {
 }
 
 async function hydrate($: EngineInterface): Promise<void> {
+  cancelSearch();
   epoch++;
   session = await $.session.id();
   root = await $.session.cwd();
@@ -61,6 +66,7 @@ async function hydrate($: EngineInterface): Promise<void> {
   selected = binding.tickets[0] ? ticketID(binding.tickets[0].issue) : '';
   results = []; boards = []; transitions = []; transitionID = ''; viewingBrief = '';
   candidates = []; recent = []; remote = []; remoteQuery = ''; searchText = ''; resultLimit = 8;
+  warmed = false;
   screen = selected ? 'ticket' : 'search'; statusOpen = false; detailsOpen = false;
   turnBinding = undefined; activeTurn = ''; submitted = []; busy = false; notice = '';
   await save($);
@@ -94,40 +100,69 @@ function filterSearch(): void {
   resultLimit = 8;
 }
 
+function cancelSearch(): void {
+  searchTimer?.cancel(); searchTimer = undefined;
+  searchVersion++; searching = false;
+}
+
+function queueSearch($: EngineInterface, value: string): void {
+  cancelSearch();
+  searchText = value.slice(0, 120); notice = ''; filterSearch();
+  if (searchText.trim().length >= 2) {
+    searching = true;
+    const version = searchVersion;
+    searchTimer = $.clock.after(300, () => {
+      if (version !== searchVersion) return;
+      searchTimer = undefined;
+      return search($, searchText);
+    });
+  }
+  $.ui.invalidate('ui.render');
+}
+
 async function search($: EngineInterface, query: string): Promise<void> {
+  cancelSearch();
+  const version = searchVersion;
   const started = epoch;
   const site = binding.site;
-  searchText = query.slice(0, 120);
+  searchText = query.slice(0, 120); searching = true; notice = '';
   const q = searchText.trim();
   filterSearch(); $.ui.invalidate('ui.render');
-  if (!q || !candidates.length) {
-    const lists = await Promise.allSettled([
-      atlas($, ['search', '--jql', 'assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC', '--limit', '100'], site).then(searchItems),
-      atlas($, ['search', '--jql', 'ORDER BY updated DESC', '--limit', '100'], site).then(searchItems),
-    ]);
-    if (started !== epoch) return;
-    recent = lists[0].status === 'fulfilled' ? lists[0].value : [];
-    candidates = mergeIssues(candidates, recent, lists[1].status === 'fulfilled' ? lists[1].value : []).slice(-400);
-    filterSearch(); $.ui.invalidate('ui.render');
-    if (lists.every(list => list.status === 'rejected') && !q) throw new Error(message((lists[0] as PromiseRejectedResult).reason));
+  try {
+    if (!q || !warmed) {
+      const lists = await Promise.allSettled([
+        atlas($, ['search', '--jql', 'assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC', '--limit', '100'], site).then(searchItems),
+        atlas($, ['search', '--jql', 'ORDER BY updated DESC', '--limit', '100'], site).then(searchItems),
+      ]);
+      if (started !== epoch || version !== searchVersion) return;
+      warmed = lists.some(list => list.status === 'fulfilled');
+      recent = lists[0].status === 'fulfilled' ? lists[0].value : [];
+      candidates = mergeIssues(candidates, recent, lists[1].status === 'fulfilled' ? lists[1].value : []).slice(-400);
+      filterSearch(); $.ui.invalidate('ui.render');
+      if (!warmed && !q) throw new Error(message((lists[0] as PromiseRejectedResult).reason));
+    }
+    if (q) {
+      const jql = candidateJQL(q);
+      const lists = await Promise.allSettled(ticketKey(q.toUpperCase())
+        ? [atlas($, ['get', q.toUpperCase()], site).then(value => [readIssue(value)])]
+        : [atlas($, ['suggest', '--query', q], site).then(searchItems),
+          ...(jql ? [atlas($, ['search', '--jql', jql, '--limit', '100'], site).then(searchItems)] : [])]);
+      if (started !== epoch || version !== searchVersion) return;
+      remote = lists[0].status === 'fulfilled' ? lists[0].value : []; remoteQuery = q;
+      candidates = mergeIssues(candidates, ...lists.filter(list => list.status === 'fulfilled').map(list => list.value)).slice(-400);
+      filterSearch();
+      const failed = lists.find(list => list.status === 'rejected');
+      if (failed?.status === 'rejected') notice = `Jira search incomplete: ${message(failed.reason)} Cached matches are still shown.`;
+    }
+  } catch (error) {
+    if (started === epoch && version === searchVersion) notice = message(error);
+  } finally {
+    if (started === epoch && version === searchVersion) { searching = false; $.ui.invalidate('ui.render'); }
   }
-  if (q) {
-    const jql = candidateJQL(q);
-    const lists = await Promise.allSettled(ticketKey(q.toUpperCase())
-      ? [atlas($, ['get', q.toUpperCase()], site).then(value => [readIssue(value)])]
-      : [atlas($, ['suggest', '--query', q], site).then(searchItems),
-        ...(jql ? [atlas($, ['search', '--jql', jql, '--limit', '100'], site).then(searchItems)] : [])]);
-    if (started !== epoch) return;
-    remote = lists[0].status === 'fulfilled' ? lists[0].value : []; remoteQuery = q;
-    candidates = mergeIssues(candidates, ...lists.filter(list => list.status === 'fulfilled').map(list => list.value)).slice(-400);
-    filterSearch();
-    const failed = lists.find(list => list.status === 'rejected');
-    if (failed?.status === 'rejected' && searchText.trim() === q) notice = `Jira search incomplete: ${message(failed.reason)} Cached matches are still shown.`;
-  }
-  if (searchText.trim() === q && !results.length && !notice) notice = q ? 'No matches. Try fewer words or an exact ticket key.' : 'No active tickets assigned to you. Type to search recent tickets or press Enter to search Jira.';
 }
 
 function showTicket(id: string): void {
+  cancelSearch();
   selected = id; screen = 'ticket'; statusOpen = false; detailsOpen = false;
   transitions = []; transitionID = ''; boards = []; viewingBrief = ''; notice = '';
 }
@@ -310,11 +345,17 @@ export function register(on: On): void {
   on('agent.offer', { agent: 'atlas-tickets:researcher' }, () => ({ isOffered: false }));
 
   on('command.run', { command: 'atlas' }, async ($, e) => {
+    cancelSearch();
     screen = e.args.trim() || !binding.tickets.length ? 'search' : 'ticket';
     statusOpen = false; detailsOpen = false; viewingBrief = ''; notice = '';
     await $.ui.open({ id: PANE, title: 'Atlas Tickets', focus: true, closeOnEscape: true, rows: 20, columns: 52 });
-    if (screen === 'search') await act($, () => search($, e.args));
+    if (screen === 'search') await search($, e.args);
     return {};
+  });
+
+  on('ui.close', { id: PANE }, ($, e, next) => {
+    cancelSearch();
+    return next(e);
   });
 
   on('prompt.submit', async ($, e, next) => {
@@ -378,13 +419,14 @@ export function register(on: On): void {
         if (busy) return;
         showTicket(selected || (binding.tickets[0] ? ticketID(binding.tickets[0].issue) : '')); $.ui.invalidate('ui.render');
       } }),
-      Button({ key: 'add-ticket', label: 'Add ticket', onPress: () => act($, async () => {
+      Button({ key: 'add-ticket', label: 'Add ticket', onPress: async () => {
+        if (busy) return;
         screen = 'search'; viewingBrief = ''; statusOpen = false;
-        if (!candidates.length) await search($, ''); else filterSearch();
-      }) }),
+        if (!warmed) await search($, searchText); else queueSearch($, searchText);
+      } }),
       Button({ key: 'settings', label: 'Settings', onPress: () => {
         if (busy) return;
-        screen = 'settings'; notice = ''; $.ui.invalidate('ui.render');
+        cancelSearch(); screen = 'settings'; notice = ''; $.ui.invalidate('ui.render');
       } }),
     ] }));
     rows.push(Text({ dimColor: true, wrap: 'truncate-end', children: `Outcome: ${binding.outcome || 'Uses the first attached ticket’s summary'}` }));
@@ -403,16 +445,18 @@ export function register(on: On): void {
         notice = 'Outcome saved.';
       }) }));
       rows.push(Input({ key: 'site', label: 'Jira site (optional)', value: binding.site, placeholder: 'Atlas site alias for multi-site searches', onSubmit: value => act($, async () => {
+        cancelSearch(); warmed = false;
         binding.site = value.trim().slice(0, 200); results = []; candidates = []; recent = []; remote = []; remoteQuery = ''; searchText = '';
         await save($); notice = 'Site saved. Open Add ticket to search.';
       }) }));
       rows.push(Text({ dimColor: true, children: 'Outcome changes mark existing research stale.' }));
     } else if (screen === 'search') {
       rows.push(Input({ key: 'search', label: 'Find ticket', value: searchText, placeholder: 'Key, words, or abbreviation', autoFocus: true,
-        onInput: value => { searchText = value.slice(0, 120); notice = ''; filterSearch(); $.ui.invalidate('ui.render'); },
-        onSubmit: value => act($, () => search($, value)), submitLabel: 'Search Jira',
+        onInput: value => queueSearch($, value),
+        onSubmit: value => search($, value), submitLabel: 'Search now',
       }));
-      rows.push(Text({ dimColor: true, children: 'Type to fuzzy filter · Enter searches Jira' }));
+      rows.push(Text({ dimColor: true, children: 'Searches Jira as you type · Enter searches now' }));
+      if (searching) rows.push(Text({ color: 'yellow', children: 'Searching Jira…' }));
       rows.push(Text({ dimColor: true, children: searchText.trim() ? `${results.length} matches · recent tickets + Jira results` : 'Your active tickets · type to search recent tickets' }));
       for (const issue of results.slice(0, resultLimit)) {
         const attached = binding.tickets.some(t => ticketID(t.issue) === ticketID(issue));
@@ -420,7 +464,7 @@ export function register(on: On): void {
         const summary = issue.summary.length > width ? `${issue.summary.slice(0, width - 1)}…` : issue.summary;
         rows.push(Button({ key: `attach-${ticketID(issue)}`, label: `${attached ? 'Open' : 'Attach'} ${issue.key} · ${summary}`, onPress: () => act($, () => attach($, issue)) }));
       }
-      if (!results.length && !busy) rows.push(Text({ children: 'No matches. Press Enter to search Jira, or try a ticket key.' }));
+      if (!results.length && !busy && !searching) rows.push(Text({ children: !searchText.trim() ? 'No active tickets assigned to you. Type to search Jira.' : searchText.trim().length < 2 ? 'Type at least 2 characters to search Jira.' : 'No matches. Try fewer words or an exact ticket key.' }));
       if (results.length > resultLimit) rows.push(Button({ key: 'more-results', label: `Show more (${resultLimit} of ${results.length})`, onPress: () => {
         resultLimit += 8; $.ui.invalidate('ui.render');
       } }));
@@ -497,7 +541,7 @@ export function register(on: On): void {
     } else rows.push(Text({ children: 'No tickets attached. Choose Add ticket to get started.' }));
     if (activeTurn) rows.push(Text({ dimColor: true, children: 'Attachment changes apply to new prompts.' }));
     rows.push(Box({ flexDirection: 'row', gap: 1, children: [
-      Button({ key: 'close', label: 'Close', onPress: () => $.ui.close({ id: PANE }) }),
+      Button({ key: 'close', label: 'Close', onPress: () => { cancelSearch(); return $.ui.close({ id: PANE }); } }),
       Text({ dimColor: true, children: screen === 'ticket' && !statusOpen && !viewingBrief ? 's status · r refresh · Esc close' : 'Tab move · Enter · Esc close' }),
     ] }));
     return Box({ flexDirection: 'column', paddingX: 1, children: rows });

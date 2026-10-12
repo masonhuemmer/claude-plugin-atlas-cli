@@ -1,4 +1,4 @@
-import { expect, test } from 'claude-code/testing';
+import { expect, mock, test } from 'claude-code/testing';
 import type { On } from 'claude-code';
 import { empty, readIssue, ticketID } from '../hooks/model.ts';
 import type { Issue } from '../hooks/model.ts';
@@ -23,6 +23,8 @@ function fixture(on: On) {
     failWrite: false, failTransition: false, transitionStatus: 'In Progress', gitDiff: '',
     searchItems: undefined as Issue[] | undefined, suggestions: undefined as Issue[] | undefined,
     discovered: undefined as Issue[] | undefined,
+    clock: mock.clock(on, { now: 1791800000000 }),
+    suggestDelay: {} as Record<string, number>, suggestResults: {} as Record<string, Issue[]>,
   };
   on('session.id', () => ({ value: f.session }));
   on('session.cwd', () => ({ value: '/repo' }));
@@ -33,7 +35,6 @@ function fixture(on: On) {
   // Claude Code 2.1.296's test bridge reads both the event and Agent-tool result.
   on('agent.spawn', ($, e) => { f.spawns.push(e); return { model: 'haiku', agentId: `research-${f.spawns.length}`, result: { status: 'async_launched', agentId: `research-${f.spawns.length}`, resolvedModel: 'haiku' } }; });
   on('command.register', ($, e) => ({ value: { command: e.name } }));
-  on('clock.now', () => ({ value: 1791800000000 }));
   on('env.get', () => ({ value: '/home/test' }));
   on('store.get', ($, e) => ({ value: f.saved.get(e.key) }));
   on('store.set', ($, e) => { f.saved.set(e.key, JSON.parse(JSON.stringify(e.value))); return { value: undefined }; });
@@ -46,13 +47,17 @@ function fixture(on: On) {
   on('prompt.submit', ($, e) => ({ text: e.text, context: e.context }));
   on('turn.start', ($, e) => ({ turnId: e.turnId }));
   on('turn.complete', ($, e) => ({ text: e.answer }));
-  on('process.run', ($, e) => {
+  on('process.run', async ($, e) => {
     const argv = [...e.argv]; f.commands.push(argv);
     const ok = (value: unknown) => ({ value: { isStdoutTruncated: false, isStderrTruncated: false, exitCode: 0, stdout: JSON.stringify(value), stderr: '' } });
     if (argv[0] === 'git') return { value: { isStdoutTruncated: false, isStderrTruncated: false, exitCode: 0, stdout: argv[1] === 'diff' ? f.gitDiff : 'abc123', stderr: '' } };
     if (argv[0] === 'rg') return { value: { isStdoutTruncated: false, isStderrTruncated: false, exitCode: 0, stdout: 'src/picker.ts\nREADME.md\n', stderr: '' } };
     if (argv[2] === 'get') return f.failGet ? { value: { isStdoutTruncated: false, isStderrTruncated: false, exitCode: 5, stdout: '', stderr: 'Jira unavailable' } } : ok({ ...f.issue, key: argv[3], browse_url: `https://${f.issue.site}/browse/${argv[3]}` });
-    if (argv[2] === 'suggest') return ok({ items: f.suggestions ?? [f.issue] });
+    if (argv[2] === 'suggest') {
+      const items = f.suggestResults[argv[4]] ?? f.suggestions ?? [f.issue];
+      if (f.suggestDelay[argv[4]]) await f.clock.sleep(f.suggestDelay[argv[4]]);
+      return ok({ items });
+    }
     if (argv[2] === 'search') return ok({ items: argv[4]?.startsWith('(summary') ? f.discovered ?? f.searchItems ?? [f.issue] : f.searchItems ?? [f.issue] });
     if (argv[2] === 'boards') return ok([{ id: 7, name: 'Product' }]);
     if (argv[2] === 'board') return ok({ schema_version: 1, board_id: 7, board_name: 'Product', state: 'in_column', column: f.issue.status === 'Open' ? 'Backlog' : 'Doing', status: f.issue.status, on_board: true });
@@ -115,6 +120,75 @@ test('Enter discovers and fuzzy ranks tickets outside the recent cache', async (
   await ui.input({ key: 'search', text: 'tikcet pcker' });
   expect(await ui.find({ key: `attach-${ID}` })).toBeDefined();
   expect(f.commands.some(a => a[2] === 'search' && a[4].includes('summary ~ "ti*"'))).toBe(true);
+});
+
+test('typing automatically discovers Jira matches after a short debounce without Enter', async ($, on) => {
+  const f = fixture(on);
+  f.searchItems = []; f.suggestions = []; f.discovered = [ISSUE];
+  await $.session.start(START);
+  await $.command.run({ command: 'atlas', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 100 }, args: '' });
+  const ui = await $.ui.mount(PANE);
+  await ui.input({ key: 'search', text: 'tikcet pcker', kind: 'change' });
+  await f.clock.advance(299);
+  expect(f.commands.filter(a => a[2] === 'suggest')).toHaveLength(0);
+  await f.clock.advance(1);
+  expect(await ui.find({ key: `attach-${ID}` })).toBeDefined();
+  expect(f.commands.filter(a => a[2] === 'suggest')).toHaveLength(1);
+});
+
+test('newer search results survive a late response for older text', async ($, on) => {
+  const f = fixture(on);
+  const other = { ...ISSUE, key: 'AT-99', browse_url: 'https://example.atlassian.net/browse/AT-99', summary: 'Operations follow-up' };
+  f.searchItems = []; f.discovered = []; f.suggestResults = { picker: [ISSUE], database: [other] };
+  f.suggestDelay.picker = 1000;
+  await $.session.start(START);
+  await $.command.run({ command: 'atlas', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 100 }, args: '' });
+  const ui = await $.ui.mount(PANE);
+  await ui.input({ key: 'search', text: 'picker', kind: 'change' });
+  await f.clock.advance(300);
+  await ui.input({ key: 'search', text: 'database', kind: 'change' });
+  await f.clock.advance(300);
+  expect(await ui.find({ key: `attach-${ticketID(other)}` })).toBeDefined();
+  await f.clock.advance(700);
+  expect(await ui.find({ key: `attach-${ticketID(other)}` })).toBeDefined();
+  expect(await ui.find({ key: `attach-${ID}` })).toBeUndefined();
+});
+
+test('rapid edits debounce to one lookup and Enter flushes a pending lookup exactly once', async ($, on) => {
+  const f = fixture(on);
+  await $.session.start(START);
+  await $.command.run({ command: 'atlas', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 100 }, args: '' });
+  const ui = await $.ui.mount(PANE);
+  for (const text of ['p', 'pi', 'pic', 'picker']) {
+    await ui.input({ key: 'search', text, kind: 'change' });
+    await f.clock.advance(100);
+  }
+  expect(f.commands.filter(a => a[2] === 'suggest')).toHaveLength(0);
+  await f.clock.advance(200);
+  expect(f.commands.filter(a => a[2] === 'suggest').map(a => a[4])).toEqual(['picker']);
+  await ui.input({ key: 'search', text: 'ship picker', kind: 'change' });
+  await ui.input({ key: 'search', text: 'ship picker' });
+  await f.clock.advance(300);
+  expect(f.commands.filter(a => a[2] === 'suggest').map(a => a[4])).toEqual(['picker', 'ship picker']);
+});
+
+test('clearing the field, opening settings and closing the pane cancel pending searches', async ($, on) => {
+  const f = fixture(on);
+  await $.session.start(START);
+  await $.command.run({ command: 'atlas', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 100 }, args: '' });
+  const ui = await $.ui.mount(PANE);
+  await ui.input({ key: 'search', text: 'picker', kind: 'change' });
+  await ui.input({ key: 'search', text: '', kind: 'change' });
+  await f.clock.advance(300);
+  expect(f.commands.filter(a => a[2] === 'suggest')).toHaveLength(0);
+  await ui.input({ key: 'search', text: 'picker', kind: 'change' });
+  await ui.press({ key: 'settings' });
+  await f.clock.advance(300);
+  expect(f.commands.filter(a => a[2] === 'suggest')).toHaveLength(0);
+  await ui.press({ key: 'add-ticket' });
+  await ui.press({ key: 'close' });
+  await f.clock.advance(300);
+  expect(f.commands.filter(a => a[2] === 'suggest')).toHaveLength(0);
 });
 
 test('picker attaches an outcome and Haiku creates a durable brief for the main agent', async ($, on) => {
