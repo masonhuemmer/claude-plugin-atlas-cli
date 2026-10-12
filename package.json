@@ -1,0 +1,12 @@
+{
+  "name": "atlas-tickets",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "claude plugin test .",
+    "validate": "claude plugin validate --strict .",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": { "typescript": "^5.9.3" }
+}

@@ -1,0 +1,6 @@
+{
+  "name": "atlas-tickets",
+  "version": "0.1.0",
+  "description": "Attach Jira tickets to Claude Code outcomes, change status, and share Haiku research briefs.",
+  "author": { "name": "Mason Huemmer" }
+}
